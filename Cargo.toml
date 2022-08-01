@@ -1,0 +1,24 @@
+[package]
+name = "pseudopty"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ansi-parser = "0.8.0"
+chrono = "0.4.19"
+crossterm = { version = "0.24.0", path = "/home/zach/cratesio/crossterm" }
+#crossterm = "0.24.0"
+log = "0.4.17"
+nix = { version = "0.24.2", features = ["term", "process"] }
+termwiz = "0.16.0"
+#tokio = { version = "1.20.1", features = ["macros", "rt", "sync"] }
+tracing = "0.1.35"
+tracing-appender = "0.2.2"
+tracing-log = "0.1.3"
+tracing-subscriber = "0.3.15"
+#tui = "0.18.0"
+tui = { version = "0.18.0", path = "/home/zach/cratesio/tui" }
+unicode-width = "0.1.9"
+
+[dev-dependencies]
+tokio = { version = "1.20.1", features = ["macros", "rt"] }
