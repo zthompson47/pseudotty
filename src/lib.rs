@@ -27,7 +27,6 @@ impl Pty {
         // a future version of Rust.
         // https://github.com/rust-lang/rust/blob/master/library/std/src/io/stdio.rs#L968
         std::io::set_output_capture(None);
-
         // Include winsize or the child app won't have an area to write to.
         let winsize = Winsize {
             ws_row: 20,
@@ -35,8 +34,7 @@ impl Pty {
             ws_xpixel: 640,
             ws_ypixel: 480,
         };
-
-        // Fork and attach child process to pty.
+        // Fork, and attach child process to pty.
         let pty = unsafe { forkpty(Some(&winsize), None).unwrap() };
         match pty.fork_result {
             Child => {
@@ -45,40 +43,9 @@ impl Pty {
                 unsafe { _exit(0) }
             }
             Parent { child } => {
-                /*
-                let (tx, rx) = std::sync::mpsc::channel();
-                std::thread::spawn(move || {
-                    let mut buf = [0u8; 1024];
-                    let mut parser = AnsiParser::new();
-                    'out: loop {
-                        if select_read(pty.master, None) {
-                            let len = match read(pty.master, &mut buf) {
-                                Ok(len) => len,
-                                Err(_) => break 'out,
-                            };
-                            if len > 0 {
-                                let actions = parser.parse_as_vec(&buf[..len]);
-                                //dbg!(&actions);
-                                for action in actions {
-                                    if tx.send(action).is_err() {
-                                        break 'out;
-                                    }
-                                }
-                            } else {
-                                break 'out;
-                            }
-                        } else {
-                            break 'out;
-                        }
-                    }
-                });
-                */
-
-                // Return handle to pty master.
                 Pty {
                     master: pty.master,
                     child,
-                    //rx_action: rx,
                     action_buf: VecDeque::new(),
                 }
             }
@@ -324,16 +291,6 @@ mod tests_tui {
 
     use super::*;
 
-    /*
-    fn print_action_vec(v: &Vec<Action>) {
-        println!("[");
-        for a in v {
-            println!("  {a:?}");
-        }
-        println!("]");
-    }
-    */
-
     #[test]
     fn test_main() {
         Pty::with(|| {
@@ -344,33 +301,6 @@ mod tests_tui {
             i("\x1bq");
             o(&[Print('e')]);
         });
-        /* Dump pty output.
-        select_read(pty.master, Some(10));
-        let s = read_all(pty.master);
-        let s = parser.parse_as_vec(&s);
-        print_action_vec(&s);
-
-        //println!("11{s:?}");
-        //pty.input(b"hello there");
-        //pty.input(b"\n");
-        //pty.input(b"n");
-        pty.input(b"ehello\n");
-
-        select_read(pty.master, Some(10));
-        let s = read_all(pty.master);
-        let s = parser.parse_as_vec(&s);
-        print_action_vec(&s);
-
-        //pty.input(b"\x1bq");
-        pty.input(b"\x1bq");
-
-        select_read(pty.master, Some(10));
-        let s = read_all(pty.master);
-        let s = parser.parse_as_vec(&s);
-        print_action_vec(&s);
-
-        panic!()
-        */
     }
 
     enum InputMode {
@@ -736,3 +666,32 @@ impl Context for TuiState {
     }
 }
 */
+
+                /*
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 1024];
+                    let mut parser = AnsiParser::new();
+                    'out: loop {
+                        if select_read(pty.master, None) {
+                            let len = match read(pty.master, &mut buf) {
+                                Ok(len) => len,
+                                Err(_) => break 'out,
+                            };
+                            if len > 0 {
+                                let actions = parser.parse_as_vec(&buf[..len]);
+                                //dbg!(&actions);
+                                for action in actions {
+                                    if tx.send(action).is_err() {
+                                        break 'out;
+                                    }
+                                }
+                            } else {
+                                break 'out;
+                            }
+                        } else {
+                            break 'out;
+                        }
+                    }
+                });
+                */
