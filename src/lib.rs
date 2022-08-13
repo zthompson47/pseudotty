@@ -1,6 +1,4 @@
 #![feature(internal_output_capture)]
-pub mod logging;
-
 use std::{collections::VecDeque, os::unix::io::RawFd, str};
 
 use nix::{
@@ -195,7 +193,6 @@ impl Pty {
         let expected: Vec<Action> = expected.iter().flat_map(|x| x.actions()).collect();
         for action in &expected[..] {
             if let Some(next) = self.next_action() {
-                //log::info!("-->> {:?}", next);
                 matched.push(next.clone());
                 if action != &next {
                     break;
@@ -217,7 +214,6 @@ impl Pty {
             let mut matched = Vec::new();
             for action in expected {
                 if let Some(next) = self.next_action() {
-                    log::info!("-->> {:?}", next);
                     matched.push(next.clone());
                     if action != &next {
                         break;
@@ -243,7 +239,6 @@ impl Pty {
                 };
                 if len > 0 {
                     let mut actions = VecDeque::from(parser.parse_as_vec(&buf[..len]));
-                    log::info!("{actions:#?}");
                     self.action_buf.append(&mut actions);
                 } else {
                     break;
@@ -252,7 +247,6 @@ impl Pty {
                 break;
             }
         }
-        //log::info!("{:?}", self.action_buf);
         self.action_buf.pop_front()
     }
 }
@@ -284,7 +278,6 @@ mod tests {
 
     #[test]
     fn test_async_child() {
-        let _l = crate::logging::devlog();
         let mut pty = Pty::with(|| {
             print!("x");
             println!("x");
@@ -427,8 +420,6 @@ mod tests_tui {
     }
 
     fn main() -> Result<(), Box<dyn Error>> {
-        let _l = crate::logging::devlog();
-
         // setup terminal
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -570,237 +561,3 @@ mod tests_tui {
         f.render_widget(messages, chunks[2]);
     }
 }
-
-/*
-pub fn with_pty(f: impl Fn()) -> Pty {
-    // Force `--nocapture` with this unstable hidden function that might disappear in future Rust.
-    // https://github.com/rust-lang/rust/blob/master/library/std/src/io/stdio.rs#L968
-    std::io::set_output_capture(None);
-
-    // Include winsize or the child app won't have an area to write to.
-    let winsize = Winsize {
-        ws_row: 20,
-        ws_col: 80,
-        ws_xpixel: 640,
-        ws_ypixel: 480,
-    };
-
-    // Fork and attach child process to pty.
-    let pty = unsafe { forkpty(Some(&winsize), None).unwrap() };
-    match pty.fork_result {
-        Child => {
-            f();
-            pause();
-            unsafe { _exit(0) }
-        }
-        Parent { child } => {
-            let (tx, rx) = std::sync::mpsc::channel();
-
-            std::thread::spawn(move || {
-                log::info!("enter thread");
-                let mut buf = [0u8; 1024];
-                let mut parser = AnsiParser::new();
-
-                'out: loop {
-                    log::info!("enter read loop");
-                    if select_read(pty.master, None) {
-                        log::info!("got select");
-                        let len = match read(pty.master, &mut buf) {
-                            Ok(len) => len,
-                            Err(err) => {
-                                log::info!("got PANIC");
-                                panic!("{err}")
-                            }
-                        };
-                        log::info!("got len {len}");
-                        if len > 0 {
-                            let actions = parser.parse_as_vec(&buf[..len]);
-                            dbg!(&actions);
-                            log::info!("got action vec len >> {}", actions.len());
-                            for action in actions {
-                                log::warn!(">>> {action:?}");
-                                if tx.send(action).is_err() {
-                                    log::warn!("+_+_+_+_+_+_+_+ tx.send IS_ERR");
-                                    break 'out;
-                                }
-                            }
-                        } else {
-                            break 'out;
-                        }
-                    } else {
-                        break 'out;
-                    }
-                }
-            });
-
-            Pty {
-                master: pty.master,
-                child,
-                rx_action: rx,
-            }
-        }
-    }
-}
-*/
-
-/*
-// For human readable output in tests.  Ansi commands might mess up your terminal, so beware.
-pub fn assert_str_eq(left: &[u8], right: &[u8]) {
-    assert_eq!(
-        str::from_utf8(left).unwrap(),
-        str::from_utf8(right).unwrap()
-    )
-}
-*/
-
-/* Pty
-pub fn input(&self, b: &[u8]) {
-    write(self.master, b).unwrap();
-}
-*/
-
-/*
-pub fn expect(&self, b: &[u8]) {
-    let mut buf = Vec::from(b);
-    read_exact(self.master, &mut buf);
-    assert_str_eq(b, &buf);
-}
-*/
-
-/*
-pub fn expect_str(&self, _s: &str) {
-    // TODO
-    let mut parser = AnsiParser::new();
-    let chunk = read_all(self.master);
-    let _parsed = parser.parse_as_vec(&chunk);
-}
-*/
-
-/*
-pub fn expect_ansi(&self, expected: Vec<Action>) {
-    let mut parser = AnsiParser::new();
-    let chunk = read_all(self.master);
-    let parsed = parser.parse_as_vec(&chunk);
-    assert_eq!(expected, parsed);
-}
-
-pub fn expect_ansi2(&mut self, expected: Vec<Action>) {
-    for action in expected {
-        match self.rx_action.try_recv() {
-            Ok(a) => assert_eq!(action, a),
-            Err(TryRecvError::Empty) => {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                match self.rx_action.try_recv() {
-                    Ok(a) => assert_eq!(action, a),
-                    _ => panic!(),
-                }
-            }
-            Err(TryRecvError::Disconnected) => panic!(),
-        }
-    }
-}
-*/
-
-/*
-fn read_all(fd: RawFd) -> Vec<u8> {
-    let mut result = Vec::new();
-    let mut buf = [0u8; 1024];
-    loop {
-        if select_read(fd, Some(10)) {
-            let len = read(fd, &mut buf).unwrap();
-            if len > 0 {
-                let mut v = Vec::from(&buf[0..len]);
-                result.append(&mut v);
-            } else {
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-    //println!("[01]_{result:?}");
-    result
-}
-*/
-
-/*
-// Pilfered from nix::test::read_exact.
-fn read_exact(fd: RawFd, buf: &mut [u8]) -> usize {
-    let mut len = 0;
-    while len < buf.len() {
-        // get_mut would be better than split_at_mut, but it requires nightly
-        let (_, remaining) = buf.split_at_mut(len);
-        if select_read(fd, Some(10)) {
-            len += read(fd, remaining).unwrap();
-        } else {
-            panic!("could only read {}/{} bytes", buf.len(), len)
-        }
-    }
-    len
-}
-*/
-
-/* TODO Pty::new(state).with(|state| {})
-trait Context {
-    type State;
-    fn setup(&self);
-    fn teardown(&self);
-    fn state(&mut self) -> &mut Self::State;
-}
-struct TuiState;
-impl Context for TuiState {
-    type State = Self;
-
-    fn setup(&self) {
-        todo!()
-    }
-    fn teardown(&self) {
-        todo!()
-    }
-    fn state(&mut self) -> &mut TuiState {
-        todo!()
-    }
-}
-*/
-
-/*
-let (tx, rx) = std::sync::mpsc::channel();
-std::thread::spawn(move || {
-    let mut buf = [0u8; 1024];
-    let mut parser = AnsiParser::new();
-    'out: loop {
-        if select_read(pty.master, None) {
-            let len = match read(pty.master, &mut buf) {
-                Ok(len) => len,
-                Err(_) => break 'out,
-            };
-            if len > 0 {
-                let actions = parser.parse_as_vec(&buf[..len]);
-                //dbg!(&actions);
-                for action in actions {
-                    if tx.send(action).is_err() {
-                        break 'out;
-                    }
-                }
-            } else {
-                break 'out;
-            }
-        } else {
-            break 'out;
-        }
-    }
-});
-*/
-
-/*
-#[macro_export]
-macro_rules! expect {
-    ( $( $x:expr ),* ) => {
-        let mut result = Vec::new();
-        $(
-            result.push($x);
-        )*
-        result
-    }
-}
-*/
