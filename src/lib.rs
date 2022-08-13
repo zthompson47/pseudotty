@@ -1,27 +1,87 @@
 #![feature(internal_output_capture)]
 pub mod logging;
 
-use std::collections::VecDeque;
-use std::os::unix::io::RawFd;
-use std::str;
+use std::{collections::VecDeque, os::unix::io::RawFd, str};
 
-use nix::libc::_exit;
-use nix::pty::{forkpty, Winsize};
-use nix::sys::select::{pselect, FdSet};
-use nix::sys::signal::{kill, SigSet, Signal::SIGTERM};
-use nix::sys::time::{TimeSpec, TimeValLike};
-use nix::sys::wait::wait;
-use nix::unistd::{close, pause, read, write, ForkResult::*, Pid};
-use termwiz::escape::{parser::Parser as AnsiParser, Action};
+use nix::{
+    libc::_exit,
+    pty::{forkpty, Winsize},
+    sys::{
+        select::{pselect, FdSet},
+        signal::{kill, SigSet, Signal::SIGTERM},
+        time::{TimeSpec, TimeValLike},
+        //wait::wait,
+    },
+    unistd::{close, pause, pipe, read, write, ForkResult::*, Pid},
+};
+use termwiz::escape::{
+    csi::{Cursor, CSI},
+    parser::Parser as AnsiParser,
+    Action, ControlCode, OneBased,
+};
 
 pub struct Pty {
-    master: i32,
+    fd: RawFd,
     child: Pid,
-    //rx_action: std::sync::mpsc::Receiver<Action>,
     action_buf: VecDeque<Action>,
+    child_status: ChildStatus,
+}
+
+enum ChildStatus {
+    Open(RawFd),
+    Closed,
+}
+
+#[allow(clippy::upper_case_acronyms)]
+#[derive(Debug)]
+pub enum AnsiCmd {
+    CSI(Action),
+    Str(&'static str),
+    CRLF,
+    CursorPosition(u32, u32),
+}
+
+impl AnsiCmd {
+    fn actions(&self) -> Vec<Action> {
+        let mut result = Vec::new();
+        match self {
+            Self::CSI(action) => result.push(action.clone()),
+            Self::Str(s) => {
+                for c in s.chars() {
+                    result.push(Action::Print(c));
+                }
+            }
+            Self::CRLF => {
+                result.push(Action::Control(ControlCode::CarriageReturn));
+                result.push(Action::Control(ControlCode::LineFeed));
+            }
+            Self::CursorPosition(line, col) => {
+                result.push(Action::CSI(CSI::Cursor(Cursor::Position {
+                    line: OneBased::new(*line),
+                    col: OneBased::new(*col),
+                })));
+            }
+        }
+        result
+    }
 }
 
 impl Pty {
+    pub fn child_is_closed(&mut self) -> bool {
+        match self.child_status {
+            ChildStatus::Open(fd) => {
+                if select_read(fd, Some(10)) {
+                    self.child_status = ChildStatus::Closed;
+                    close(fd).unwrap();
+                    true
+                } else {
+                    false
+                }
+            }
+            ChildStatus::Closed => true,
+        }
+    }
+
     pub fn with(f: impl Fn()) -> Self {
         // Force `--nocapture` with this unstable use of a hidden function that might disappear in
         // a future version of Rust.
@@ -34,28 +94,124 @@ impl Pty {
             ws_xpixel: 640,
             ws_ypixel: 480,
         };
+        // Set up pipe to communicate with child process.
+        let (p_parent, p_child) = pipe().unwrap();
         // Fork, and attach child process to pty.
         let pty = unsafe { forkpty(Some(&winsize), None).unwrap() };
         match pty.fork_result {
             Child => {
+                close(p_parent).unwrap();
                 f();
+                //write(p_child, b"ok\n").unwrap();
+                close(p_child).unwrap();
                 pause();
                 unsafe { _exit(0) }
             }
             Parent { child } => {
+                close(p_child).unwrap();
                 Pty {
-                    master: pty.master,
+                    fd: pty.master,
                     child,
                     action_buf: VecDeque::new(),
+                    child_status: ChildStatus::Open(p_parent),
                 }
             }
         }
     }
 
+    pub fn i(&self, s: &str) {
+        write(self.fd, s.as_bytes()).unwrap();
+    }
+
+    pub fn expect_sparse(&mut self, expected: &[AnsiCmd]) {
+        //let expected: Vec<Vec<Action>> = expected.iter().map(|x| x.actions()).collect();
+        let expected: Vec<Vec<Action>> = expected
+            .iter()
+            .flat_map(|x| match x {
+                // Sparse match between characters of string.
+                AnsiCmd::Str(s) => {
+                    let mut actions = Vec::new();
+                    for c in s.chars() {
+                        actions.push(vec![Action::Print(c)]);
+                    }
+                    actions
+                }
+                _ => vec![x.actions()],
+            })
+            .collect();
+        let mut matched: Vec<Vec<Action>> = Vec::new();
+        for action_set in &expected[..] {
+            let mut matches = Vec::new();
+            let mut missed: Option<Vec<Action>> = None;
+            while let Some(next) = self.next_action() {
+                if next == action_set[matches.len()] {
+                    matches.push(next);
+                } else {
+                    if missed.is_none() {
+                        missed = Some(matches.clone());
+                    }
+                    matches.clear();
+                }
+                if matches.len() == action_set.len() {
+                    matched.push(matches);
+                    break;
+                }
+            }
+            if let Some(missed) = missed {
+                if !missed.is_empty() {
+                    matched.push(missed);
+                }
+            }
+        }
+        self.action_buf.drain(..);
+        assert_eq!(expected, matched);
+    }
+
+    pub fn expect_contig(&mut self, expected: &[AnsiCmd]) {
+        let mut matched = Vec::new();
+        let expected: Vec<Action> = expected.iter().flat_map(|x| x.actions()).collect();
+        let mut missed: Option<Action> = None;
+        while let Some(next) = self.next_action() {
+            if next == expected[matched.len()] {
+                matched.push(next);
+            } else {
+                //matched.clear();
+                missed = Some(next);
+                break;
+            }
+            if matched.len() == expected.len() {
+                break;
+            }
+        }
+        if let Some(missed) = missed {
+            matched.push(missed);
+        }
+        self.action_buf.drain(..);
+        assert_eq!(expected, matched);
+    }
+
+    pub fn expect(&mut self, expected: &[AnsiCmd]) {
+        let mut matched = Vec::new();
+        let expected: Vec<Action> = expected.iter().flat_map(|x| x.actions()).collect();
+        for action in &expected[..] {
+            if let Some(next) = self.next_action() {
+                //log::info!("-->> {:?}", next);
+                matched.push(next.clone());
+                if action != &next {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        assert_eq!(expected, matched);
+    }
+
+    /*
     pub fn test(&mut self, f: impl Fn(&dyn Fn(&str), &mut dyn FnMut(&[Action]))) {
-        let master = self.master;
+        let fd = self.fd;
         let i = |s: &str| {
-            write(master, s.as_bytes()).unwrap();
+            write(fd, s.as_bytes()).unwrap();
         };
         let mut o = |expected: &[Action]| {
             let mut matched = Vec::new();
@@ -74,18 +230,20 @@ impl Pty {
         };
         f(&i, &mut o);
     }
+    */
 
     fn next_action(&mut self) -> Option<Action> {
         let mut buf = [0u8; 1024];
         let mut parser = AnsiParser::new();
         loop {
-            if select_read(self.master, Some(10)) {
-                let len = match read(self.master, &mut buf) {
+            if select_read(self.fd, Some(10)) {
+                let len = match read(self.fd, &mut buf) {
                     Ok(len) => len,
                     Err(_) => return None,
                 };
                 if len > 0 {
                     let mut actions = VecDeque::from(parser.parse_as_vec(&buf[..len]));
+                    log::info!("{actions:#?}");
                     self.action_buf.append(&mut actions);
                 } else {
                     break;
@@ -94,7 +252,7 @@ impl Pty {
                 break;
             }
         }
-        log::info!("{:?}", self.action_buf);
+        //log::info!("{:?}", self.action_buf);
         self.action_buf.pop_front()
     }
 }
@@ -102,8 +260,8 @@ impl Pty {
 impl Drop for Pty {
     fn drop(&mut self) {
         kill(self.child, SIGTERM).unwrap();
-        wait().unwrap();
-        close(self.master).unwrap();
+        //wait().unwrap();
+        close(self.fd).unwrap();
     }
 }
 
@@ -112,28 +270,23 @@ fn select_read(fd: RawFd, timeout: Option<i64>) -> bool {
     fd_set.insert(fd);
     let timeout = timeout.map(TimeSpec::milliseconds);
     let sigmask = SigSet::empty();
-    pselect(None, &mut fd_set, None, None, &timeout, &sigmask).unwrap() == 1
+    matches!(
+        pselect(None, &mut fd_set, None, None, &timeout, &sigmask),
+        Ok(1)
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use termwiz::escape::csi::{Cursor, CSI};
-    use termwiz::escape::ControlCode::{CarriageReturn, LineFeed};
-    use termwiz::escape::{
-        Action::{self, Control, Print},
-        OneBased,
-    };
-    use tui::backend::CrosstermBackend;
-    use tui::widgets::{Block, Borders};
-    use tui::Terminal;
-
-    use super::*;
+    //use termwiz::escape::Action::{Control, Print};
+    //use termwiz::escape::ControlCode::{CarriageReturn, LineFeed};
+    use super::{AnsiCmd::*, *};
 
     #[test]
     fn test_async_child() {
         let _l = crate::logging::devlog();
-
-        Pty::with(|| {
+        let mut pty = Pty::with(|| {
+            print!("x");
             println!("x");
             let rt = tokio::runtime::Builder::new_current_thread()
                 .build()
@@ -142,53 +295,25 @@ mod tests {
                 println!("y");
             });
             println!("z");
-        })
-        .test(|i, o| {
-            i("hw\n");
-            o(&[
-                Print('h'),
-                Print('w'),
-                Control(CarriageReturn),
-                Control(LineFeed),
-            ]);
-            o(&[
-                Print('x'),
-                Control(CarriageReturn),
-                Control(LineFeed),
-                Print('y'),
-                Control(CarriageReturn),
-                Control(LineFeed),
-                Print('z'),
-                Control(CarriageReturn),
-                Control(LineFeed),
-            ]);
         });
+        pty.expect_sparse(&[Str("xx"), Str("z")]);
+        pty.i("hw\n");
+        pty.expect(&[Str("h")]);
+        pty.expect_contig(&[Str("w"), CRLF]);
     }
 
     #[test]
     fn test_println() {
-        let _l = crate::logging::devlog();
-
-        Pty::with(|| {
+        let mut pty = Pty::with(|| {
             print!("x");
             println!("x");
-        })
-        .test(|_i, o| {
-            o(&[
-                Print('x'),
-                //Print('o'),
-                Print('x'),
-                Control(CarriageReturn),
-                Control(LineFeed),
-                //Print('1'),
-                //Print('2'),
-            ]);
         });
+        pty.expect(&[Str("x"), Str("x"), CRLF]);
     }
 
     #[test]
     fn hello_world_simple() {
-        Pty::with(|| {
+        let mut pty = Pty::with(|| {
             print!("oof");
             print!("Name: ");
             let mut buf = String::new();
@@ -196,58 +321,36 @@ mod tests {
                 Ok(_) => println!("hello {buf}"),
                 Err(err) => print!("error: {err}"),
             }
-        })
-        .test(|_i, o| {
-            // Nothing shows up without flushing stdout.
-            o(&[]);
         });
+        pty.expect(&[]);
     }
 
     #[test]
     fn hello_world_ansi() {
-        Pty::with(|| {
+        let mut pty = Pty::with(|| {
             print!("Name: ");
             //std::io::stdout().lock().flush().unwrap();
             let mut buf = String::new();
             match std::io::stdin().read_line(&mut buf) {
                 Ok(2) => {
-                    //assert_eq!(buf.len(), 2); // TODO - hmmmmmmmmmmmmmmmmmmmmmmmm
+                    assert_eq!(buf.len(), 2); // TODO - hmmmmmmmmmmmmmmmmmmmmmmmm
                     println!("hello {buf}");
                 }
                 Err(err) => print!("error: {err}"),
                 _ => print!("error"),
             }
-        })
-        .test(|i, o| {
-            i("w\n");
-            o(&[
-                Print('w'),
-                Control(CarriageReturn),
-                Control(LineFeed),
-                Print('N'),
-                Print('a'),
-                Print('m'),
-                Print('e'),
-                Print(':'),
-                Print(' '),
-                Print('h'),
-                Print('e'),
-                Print('l'),
-                Print('l'),
-                Print('o'),
-                Print(' '),
-                Print('w'),
-                Control(CarriageReturn),
-                Control(LineFeed),
-                Control(CarriageReturn),
-                Control(LineFeed),
-            ]);
         });
+        pty.i("w\n");
+        pty.expect(&[Str("w"), CRLF, Str("Name: hello w"), CRLF, CRLF]);
     }
 
     #[test]
     fn hello_world_tui() {
-        Pty::with(|| {
+        use tui::backend::CrosstermBackend;
+        use tui::widgets::{Block, Borders};
+        use tui::Terminal;
+
+        let _pty = Pty::with(|| {
             let stdout = std::io::stdout();
             let backend = CrosstermBackend::new(stdout);
             let mut terminal = Terminal::new(backend).unwrap();
@@ -258,14 +361,12 @@ mod tests {
                     f.render_widget(block, size);
                 })
                 .unwrap();
-        })
-        .test(|_i, o| {
-            // TODO this gets way too difficult..  Needs pattern matching or `contains(&[Action])`.
-            o(&[Action::CSI(CSI::Cursor(Cursor::Position {
-                line: OneBased::new(1),
-                col: OneBased::new(1),
-            }))]);
         });
+        // TODO this gets way too difficult..  Needs pattern matching or `contains(&[Action])`.
+        //            o(&[Action::CSI(CSI::Cursor(Cursor::Position {
+        //                line: OneBased::new(1),
+        //                col: OneBased::new(1),
+        //            }))]);
     }
 }
 
@@ -278,7 +379,6 @@ mod tests_tui {
         execute,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     };
-    use termwiz::escape::Action::Print;
     use tui::{
         backend::{Backend, CrosstermBackend},
         layout::{Constraint, Direction, Layout},
@@ -289,18 +389,16 @@ mod tests_tui {
     };
     use unicode_width::UnicodeWidthStr;
 
-    use super::*;
+    use super::{AnsiCmd::*, *};
 
     #[test]
     fn test_main() {
-        Pty::with(|| {
+        let mut pty = Pty::with(|| {
             main().unwrap();
-        })
-        .test(|i, o| {
-            i("ehollo\n");
-            i("\x1bq");
-            o(&[Print('e')]);
         });
+        pty.i("ehollo\n");
+        pty.i("\x1bq");
+        pty.expect(&[Str("e")]);
     }
 
     enum InputMode {
@@ -341,10 +439,8 @@ mod tests_tui {
         // create app and run it
         let app = App::default();
         let res = run_app(&mut terminal, app);
-        /*
 
         // restore terminal
-        */
         disable_raw_mode()?;
 
         execute!(
@@ -667,31 +763,44 @@ impl Context for TuiState {
 }
 */
 
-                /*
-                let (tx, rx) = std::sync::mpsc::channel();
-                std::thread::spawn(move || {
-                    let mut buf = [0u8; 1024];
-                    let mut parser = AnsiParser::new();
-                    'out: loop {
-                        if select_read(pty.master, None) {
-                            let len = match read(pty.master, &mut buf) {
-                                Ok(len) => len,
-                                Err(_) => break 'out,
-                            };
-                            if len > 0 {
-                                let actions = parser.parse_as_vec(&buf[..len]);
-                                //dbg!(&actions);
-                                for action in actions {
-                                    if tx.send(action).is_err() {
-                                        break 'out;
-                                    }
-                                }
-                            } else {
-                                break 'out;
-                            }
-                        } else {
-                            break 'out;
-                        }
+/*
+let (tx, rx) = std::sync::mpsc::channel();
+std::thread::spawn(move || {
+    let mut buf = [0u8; 1024];
+    let mut parser = AnsiParser::new();
+    'out: loop {
+        if select_read(pty.master, None) {
+            let len = match read(pty.master, &mut buf) {
+                Ok(len) => len,
+                Err(_) => break 'out,
+            };
+            if len > 0 {
+                let actions = parser.parse_as_vec(&buf[..len]);
+                //dbg!(&actions);
+                for action in actions {
+                    if tx.send(action).is_err() {
+                        break 'out;
                     }
-                });
-                */
+                }
+            } else {
+                break 'out;
+            }
+        } else {
+            break 'out;
+        }
+    }
+});
+*/
+
+/*
+#[macro_export]
+macro_rules! expect {
+    ( $( $x:expr ),* ) => {
+        let mut result = Vec::new();
+        $(
+            result.push($x);
+        )*
+        result
+    }
+}
+*/
